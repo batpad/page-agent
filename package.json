@@ -1,0 +1,16 @@
+{
+  "name": "page-agent",
+  "version": "0.1.0",
+  "description": "A self-contained HTML page editor: an embedded AI agent that edits the page it lives in, TiddlyWiki-style.",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "watch": "node build.mjs --watch",
+    "serve": "node server/serve.mjs .",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.0",
+    "typescript": "^5.6.0"
+  }
+}

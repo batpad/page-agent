@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Smoke Test</title>
+  <style id="page-styles">body { font-family: sans-serif; }</style>
+  <script type="application/json" id="pa-config">
+{ "version": 1, "plugins": [{ "name": "test-plugin", "src": "inline" }] }
+  </script>
+</head>
+<body>
+  <main>
+    <h1>Original Heading</h1>
+    <p class="lead">Lead paragraph</p>
+    <div data-volatile id="vol"><span>runtime junk</span></div>
+  </main>
+
+  <script type="text/plain" data-plugin="test-plugin">
+export default {
+  name: "test-plugin",
+  systemPrompt: "TEST PLUGIN PROMPT",
+  tools: [{
+    name: "test_tool",
+    description: "test tool",
+    parameters: { type: "object", properties: {} },
+    execute: () => "tool-ok"
+  }]
+};
+  </script>
+
+  <pre id="results">PENDING</pre>
+
+  <script>
+  // Seed settings (mock provider + plugin consent) BEFORE the bundle boots,
+  // then inject it.
+  (async () => {
+    const src = document.querySelector('script[data-plugin="test-plugin"]').textContent;
+    const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(src));
+    const hash = Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+    localStorage.setItem('page-agent:settings', JSON.stringify({
+      provider: { provider: 'mock' },
+      pluginConsent: { 'test-plugin': hash },
+    }));
+
+    const s = document.createElement('script');
+    s.src = '../dist/page-agent.js';
+    document.head.appendChild(s);
+  })();
+
+  const checks = {};
+  const eq = (name, got, want) => { checks[name] = got === want ? 'PASS' : `FAIL got=${JSON.stringify(got)} want=${JSON.stringify(want)}`; };
+  const ok = (name, got) => { checks[name] = got ? 'PASS' : 'FAIL'; };
+
+  document.addEventListener('page-agent-ready', () => {
+    // plugin loading + saver init are async — give them a beat
+    setTimeout(() => run(window.PageAgent).catch(e => finish({ fatal: String(e && e.stack || e) })), 400);
+  });
+
+  async function run(PA) {
+    const dom = PA.ctx.dom;
+    const validate = PA.ctx.validate;
+
+    ok('boot.overlay', !!document.getElementById('pa-overlay-host'));
+    ok('boot.version', typeof PA.version === 'string');
+    const shadow = document.getElementById('pa-overlay-host').shadowRoot;
+    ok('ui.help-button', !!shadow.querySelector('.iconbtn[title="How to use this editor"]'));
+    const selTarget = document.querySelector('h1');
+    PA.ui.setSelection(selTarget);
+    ok('ui.select', PA.ui.getSelection() === selTarget);
+    PA.ui.setSelection(null);
+    ok('ui.deselect', PA.ui.getSelection() === null);
+
+    // --- validation ---
+    const vOk = validate.validateFragment('<div><span>fine</span></div>');
+    ok('validate.clean', vOk.ok && !vOk.warning);
+    const vWarn = validate.validateFragment('<p><div>x</div></p>');
+    ok('validate.autocorrect-warns', vWarn.ok && !!vWarn.warning);
+    const vBody = validate.validateFragment('<body><p>x</p></body>');
+    ok('validate.rejects-body', !vBody.ok);
+    const vCfg = validate.validateFragment('<script type="application/json" id="pa-config">{}<\/script>');
+    ok('validate.rejects-config', !vCfg.ok);
+
+    // --- edit ops + undo ---
+    dom.tagPage();
+    const h1 = document.querySelector('h1');
+    const h1id = h1.getAttribute('data-pa');
+    const r1 = dom.setText(h1id, 'Edited Heading');
+    ok('ops.setText', r1.ok && h1.textContent === 'Edited Heading');
+    const r2 = dom.insertHtml(h1id, 'after', '<p id="added">added para</p>');
+    ok('ops.insert', r2.ok && !!document.getElementById('added'));
+    const depth = dom.undoDepth();
+    dom.undo(2);
+    ok('ops.undo', !document.getElementById('added') && h1.textContent === 'Original Heading' && dom.undoDepth() === depth - 2);
+    // protected elements refuse edits
+    const cfgEl = document.getElementById('pa-config');
+    cfgEl.setAttribute('data-pa', 'zz99');
+    const rProt = dom.removeElement('zz99');
+    ok('ops.protects-config', !rProt.ok);
+
+    // --- serialization ---
+    dom.setText(h1id, 'Saved Heading');
+    const html = PA.serialize();
+    ok('ser.doctype', html.startsWith('<!doctype html>'));
+    ok('ser.keeps-editor-tag', /<script[^>]*data-pa-editor/.test(html));
+    ok('ser.keeps-config', html.includes('id="pa-config"'));
+    const sdoc = new DOMParser().parseFromString(html, 'text/html');
+    ok('ser.no-overlay', !sdoc.getElementById('pa-overlay-host'));
+    ok('ser.no-ids', !sdoc.querySelector('[data-pa]'));
+    ok('ser.volatile-emptied', /<div[^>]*data-volatile[^>]*id="vol"[^>]*><\/div>|<div[^>]*id="vol"[^>]*data-volatile[^>]*><\/div>/.test(html));
+    ok('ser.content-present', html.includes('Saved Heading'));
+    // tamper: remove editor marker from a clone → invariant repair re-adds
+    const html2 = PA.serialize();
+    ok('ser.stable', html2 === html);
+
+    // --- managed scripts ---
+    const rs = dom.upsertScript('probe', 'window.__scriptRan = (window.__scriptRan||0)+1;');
+    await new Promise(r => setTimeout(r, 80));
+    ok('scripts.runs', rs.ok && window.__scriptRan === 1);
+    dom.upsertScript('probe', 'window.__scriptRan = (window.__scriptRan||0)+10;');
+    await new Promise(r => setTimeout(r, 80));
+    ok('scripts.update-reruns', window.__scriptRan === 11);
+    const serScripts = PA.serialize();
+    ok('scripts.serialized', serScripts.includes('data-pa-script="probe"') && serScripts.includes('+10'));
+
+    // --- agent loop with mock provider + plugin tool ---
+    window.__paMockScript = [
+      { content: 'Changing the lead.', toolCalls: [{ name: 'set_text', arguments: { id: document.querySelector('.lead').getAttribute('data-pa'), text: 'Agent was here' } }] },
+      { content: '', toolCalls: [{ name: 'test_tool', arguments: {} }] },
+      { content: 'All done.' },
+    ];
+    await new Promise((resolve) => {
+      PA._debug.loop.run('change the lead text', {
+        onAssistantStart() {}, onAssistantText() {}, onAssistantDone() {},
+        onToolCall() {}, onToolResult() {},
+        onError(m) { checks['loop.error'] = 'FAIL ' + m; },
+        onFinished: resolve,
+      });
+    });
+    eq('loop.edit-applied', document.querySelector('.lead').textContent, 'Agent was here');
+    const log = window.__paMockLog;
+    ok('loop.system-prompt', log[0][0].role === 'system' && log[0][0].content.includes('RULES'));
+    ok('loop.plugin-prompt', log[0][0].content.includes('TEST PLUGIN PROMPT'));
+    const lastMsgs = log[log.length - 1];
+    ok('loop.plugin-tool-ran', lastMsgs.some(m => m.role === 'tool' && m.content === 'tool-ok'));
+    ok('loop.dirty', PA._debug.saver.state.dirty === true);
+
+    // --- saver detection (file:// → fsa should be detected in Chrome) ---
+    checks['saver.backend'] = 'INFO ' + PA._debug.saver.state.detected;
+
+    finish(checks);
+  }
+
+  function finish(obj) {
+    document.getElementById('results').textContent = 'RESULTS_JSON' + JSON.stringify(obj) + 'END_RESULTS';
+  }
+  setTimeout(() => {
+    if (document.getElementById('results').textContent === 'PENDING') finish({ fatal: 'timed out waiting for page-agent-ready' });
+  }, 6000);
+  </script>
+</body>
+</html>

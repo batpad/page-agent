@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Map Notebook</title>
+  <style id="page-styles">
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  line-height: 1.6; color: #2a2d33;
+  max-width: 48rem; margin: 0 auto; padding: 3rem 1.5rem;
+}
+.map { height: 320px; border-radius: 8px; border: 1px solid #d8dbe0; }
+  </style>
+  <script type="application/json" id="pa-config">
+{
+  "version": 1,
+  "plugins": [{ "name": "map-tools", "src": "inline" }]
+}
+  </script>
+  <script src="../dist/page-agent.js" defer data-pa-editor="1"></script>
+</head>
+<body>
+  <main>
+    <h1>Map notebook</h1>
+    <p>This page carries a <strong>map-tools</strong> plugin inside itself. Ask the agent things like
+      <em>“add a map of Lisbon with a marker on the old town”</em> — the plugin gives it an
+      <code>add_map</code> tool that does the Leaflet wiring.</p>
+  </main>
+
+  <!-- The plugin travels with this file. It is inert (type="text/plain")
+       until the editor loads it, with your consent, as an ES module. -->
+  <script type="text/plain" data-plugin="map-tools">
+const RENDER_SCRIPT = `
+const CSS_URL = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
+const JS_URL = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
+async function ensureLeaflet() {
+  if (!document.querySelector('link[data-leaflet]')) {
+    const l = document.createElement('link');
+    l.rel = 'stylesheet'; l.href = CSS_URL;
+    l.setAttribute('data-leaflet', '1');
+    l.setAttribute('data-ephemeral', '1'); // re-added at runtime, never saved
+    document.head.appendChild(l);
+  }
+  if (!window.L) {
+    await new Promise((res, rej) => {
+      const s = document.createElement('script');
+      s.src = JS_URL; s.onload = res; s.onerror = rej;
+      s.setAttribute('data-ephemeral', '1');
+      document.head.appendChild(s);
+    });
+  }
+}
+async function renderMaps() {
+  const maps = document.querySelectorAll('.map[data-map-center]');
+  if (!maps.length) return;
+  await ensureLeaflet();
+  for (const div of maps) {
+    if (div.children.length) continue; // already initialized this session
+    const [lat, lng] = div.dataset.mapCenter.split(',').map(Number);
+    const zoom = Number(div.dataset.mapZoom || 13);
+    const map = L.map(div).setView([lat, lng], zoom);
+    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; OpenStreetMap contributors'
+    }).addTo(map);
+    if (div.dataset.mapMarker) {
+      const [mlat, mlng] = div.dataset.mapMarker.split(',').map(Number);
+      const m = L.marker([mlat, mlng]).addTo(map);
+      if (div.dataset.mapMarkerLabel) m.bindPopup(div.dataset.mapMarkerLabel);
+    }
+  }
+}
+renderMaps();
+`;
+
+export default {
+  name: 'map-tools',
+  version: '1',
+  systemPrompt:
+    'This page has map support. To add a map, use the add_map tool (never hand-write Leaflet code). ' +
+    'Maps are divs with class "map"; their size is styled via the stylesheet (.map { height: … }).',
+  tools: [
+    {
+      name: 'add_map',
+      description: 'Insert an interactive OpenStreetMap map (Leaflet) relative to an existing element.',
+      parameters: {
+        type: 'object',
+        properties: {
+          target_id: { type: 'string', description: 'Existing element id to position against' },
+          position: { type: 'string', enum: ['before', 'after', 'prepend', 'append'] },
+          center: { type: 'string', description: 'Map center as "lat,lng", e.g. "38.7169,-9.1399"' },
+          zoom: { type: 'integer', description: 'Zoom level 1-19 (13 = city)', default: 13 },
+          marker: { type: 'string', description: 'Optional marker as "lat,lng"' },
+          marker_label: { type: 'string', description: 'Optional popup text for the marker' }
+        },
+        required: ['target_id', 'position', 'center']
+      },
+      execute(args, ctx) {
+        const attrs = [
+          'class="map"', 'data-volatile',
+          `data-map-center="${args.center}"`,
+          `data-map-zoom="${args.zoom ?? 13}"`,
+          args.marker ? `data-map-marker="${args.marker}"` : '',
+          args.marker_label ? `data-map-marker-label="${String(args.marker_label).replace(/"/g, '&quot;')}"` : ''
+        ].filter(Boolean).join(' ');
+        const r = ctx.dom.insertHtml(args.target_id, args.position, `<div ${attrs}></div>`);
+        if (!r.ok) return 'ERROR: ' + r.error;
+        ctx.dom.upsertScript('map-render', RENDER_SCRIPT);
+        ctx.markDirty();
+        return `Map added ${args.position} ${args.target_id}. It renders at runtime into a data-volatile container.`;
+      }
+    }
+  ]
+};
+  </script>
+</body>
+</html>
